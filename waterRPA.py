@@ -229,6 +229,10 @@ class TaskConfigDialog(QDialog):
         self.s_min_edit = QLineEdit(str(data.get("custom_scale_min", "1.0")))
         self.s_max_edit = QLineEdit(str(data.get("custom_scale_max", "1.0")))
         self.s_step_edit = QLineEdit(str(data.get("custom_scale_step", "0.05")))
+        self.timeout_edit = QLineEdit(str(data.get("custom_timeout", "0.0")))
+        self.freq_edit = QLineEdit(str(data.get("custom_freq", "0.01")))
+        self.disable_skip_chk = QCheckBox("禁止立即跳过，持续等待直到超时")
+        self.disable_skip_chk.setChecked(data.get("custom_disable_skip", True))
         self.gray_chk = QCheckBox("灰度匹配 (取消则严格区分颜色)")
         self.gray_chk.setChecked(data.get("custom_gray", True))
         
@@ -236,11 +240,18 @@ class TaskConfigDialog(QDialog):
         form.addRow("最小缩放倍率:", self.s_min_edit)
         form.addRow("最大缩放倍率:", self.s_max_edit)
         form.addRow("缩放步长:", self.s_step_edit)
+        form.addRow("识别超时(s):", self.timeout_edit)
+        form.addRow("识别频率(s):", self.freq_edit)
+        form.addRow("策略:", self.disable_skip_chk)
         form.addRow("色彩模式:", self.gray_chk)
         
         layout.addWidget(self.form_widget)
         self.form_widget.setEnabled(self.enable_chk.isChecked())
         self.enable_chk.toggled.connect(self.form_widget.setEnabled)
+        
+        self.timeout_edit.setToolTip("当目标未找到时，最多等待此时间后结束识别，0表示使用全局超时设置。")
+        self.freq_edit.setToolTip("识别循环间隔，单位秒。数值越小检测越频繁。")
+        self.disable_skip_chk.setToolTip("勾选后，当找不到目标时会一直等待直到超时或找到》不勾选则会立即跳过当前指令。")
         
         btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn_box.accepted.connect(self.accept)
@@ -254,6 +265,9 @@ class TaskConfigDialog(QDialog):
             "custom_scale_min": self.s_min_edit.text(),
             "custom_scale_max": self.s_max_edit.text(),
             "custom_scale_step": self.s_step_edit.text(),
+            "custom_timeout": self.timeout_edit.text(),
+            "custom_freq": self.freq_edit.text(),
+            "custom_disable_skip": self.disable_skip_chk.isChecked(),
             "custom_gray": self.gray_chk.isChecked()
         }
 
@@ -618,6 +632,7 @@ class RPAEngine:
         self.enable_tm_stop = True 
         self.enable_tr_stop = True 
         self.enable_key_stop = True
+        self.timeout_failsafe = False
         
         self.callback_msg = None
         self.opencv_available = False 
@@ -778,6 +793,46 @@ class RPAEngine:
                 except: continue
         return None
 
+    def wait_for_target(self, img_path, cache_key, task_conf, use_gray, allow_skip=True, task_timeout=None, detect_delay=None, step_info=None):
+        if step_info is None: step_info = {'step': 0, 'loop': 0, 'cmd': ''}
+        timeout_val = self.timeout_val if task_timeout is None else float(task_timeout)
+        detect_delay_val = self.detect_delay if detect_delay is None else float(detect_delay)
+        if detect_delay_val <= 0: detect_delay_val = 0.01
+        coord = self.parse_coordinate(img_path)
+        if coord:
+            return (coord[0], coord[1], 1.0), "success"
+
+        if allow_skip:
+            return None, "not_found"
+
+        waiting_logged = False
+        start_time = time.time()
+        while True:
+            if self.check_stop_flag():
+                return None, "stopped"
+
+            if timeout_val > 0.001 and (time.time() - start_time > timeout_val):
+                if self.log_level >= 1:
+                    self.log(f"<font color='orange'>    [超时] 循环#{step_info['loop']} 步{step_info['step']}: 目标未找到，超时后跳过</font>")
+                if self.timeout_failsafe:
+                    self.log(f"<font color='red'><b>    !!! 超时急停触发 !!!</b></font>")
+                    self.stop()
+                return None, "timeout"
+
+            find_start = time.time()
+            location_tuple = self.find_target_optimized(img_path, cache_key, task_conf, use_gray)
+            find_time = time.time() - find_start
+            if location_tuple:
+                if self.log_level >= 2:
+                    local_t = time.strftime("%H:%M:%S")
+                    self.log(f"    <font color='gray'>[{local_t}] => 底层找图耗时 {find_time:.3f}s，缩放倍率: {location_tuple[2]:.2f}x</font>")
+                return location_tuple, "success"
+
+            if not waiting_logged and self.log_level >= 1:
+                self.log("    -> 未发现目标，进入持续监听等待状态...")
+                waiting_logged = True
+            time.sleep(detect_delay_val)
+
     def get_cmd_name(self, cmd_val):
         mapping = {
             1.0: "左键单击", 2.0: "左键双击", 3.0: "右键单击", 4.0: "输入文本", 
@@ -797,68 +852,34 @@ class RPAEngine:
         except: pass
         return None
 
-    def mouseClick(self, clickTimes, lOrR, img_path, reTry, step_info=None, cache_key=None, task_conf=0.8, use_gray=True):
+    def mouseClick(self, clickTimes, lOrR, img_path, reTry, step_info=None, cache_key=None, task_conf=0.8, use_gray=True, task_timeout=None, task_detect_delay=None, allow_skip=True):
         if step_info is None: step_info = {'step': 0, 'loop': 0, 'cmd': ''}
-        start_time = time.time()
-        
-        waiting_logged = False
-        coord = self.parse_coordinate(img_path)
+        location_tuple, status = self.wait_for_target(img_path, cache_key, task_conf, use_gray, allow_skip, task_timeout, task_detect_delay, step_info)
+        if status != "success":
+            if status == "not_found" and self.log_level >= 1:
+                self.log(f"<font color='orange'>    [跳过] 循环#{step_info['loop']} 步{step_info['step']}: 未能识别到目标图片 ({os.path.basename(img_path)})</font>")
+            return status
 
-        while True:
-            if self.check_stop_flag(): return "stopped"
-            if self.timeout_val > 0.001 and (time.time() - start_time > self.timeout_val): 
-                if self.log_level >= 1:
-                    self.log(f"<font color='orange'>    [超时] 循环#{step_info['loop']} 步{step_info['step']}: 等待目标超时，已跳过</font>")
-                return "timeout"
-
-            if coord:
-                location_tuple = (coord[0], coord[1], 1.0)
-                find_time = 0.0
-            else:
-                find_start = time.time()
-                location_tuple = self.find_target_optimized(img_path, cache_key, task_conf, use_gray)
-                find_time = time.time() - find_start
-
-            if location_tuple:
-                try:
-                    x, y, scale = location_tuple
-                    
-                    if self.log_level >= 2:
-                        local_t = time.strftime("%H:%M:%S")
-                        self.log(f"    <font color='gray'>[{local_t}] => 底层找图耗时 {find_time:.3f}s，缩放倍率: {scale:.2f}x</font>")
-                    if self.log_level >= 1:
-                        self.log(f"    -> 已在坐标 ({int(x)}, {int(y)}) 锁定目标并执行点击")
-
-                    pyautogui.moveTo(x, y, duration=self.move_duration)
-                    for _ in range(clickTimes):
-                        pyautogui.mouseDown(button=lOrR)
-                        time.sleep(self.click_hold)
-                        pyautogui.mouseUp(button=lOrR)
-                        if clickTimes > 1: time.sleep(0.02)
-                    
-                    if self.settlement_wait > 0: time.sleep(self.settlement_wait)
-                    
-                    if self.enable_dodge:
-                        pyautogui.moveTo(self.dodge_x1, self.dodge_y1, duration=0)
-                        if self.enable_double_dodge:
-                            time.sleep(self.double_dodge_wait) 
-                            pyautogui.moveTo(self.dodge_x2, self.dodge_y2, duration=0)
-                            
-                except Exception as e: 
-                    if self.log_level >= 1: self.log(f"<font color='red'>    [错误] 循环#{step_info['loop']} 步{step_info['step']}: {e}</font>")
-                    return "error"
-                return "success"
-            else:
-                if reTry != -1:
-                    if self.log_level >= 1:
-                        self.log(f"<font color='orange'>    [跳过] 循环#{step_info['loop']} 步{step_info['step']}: 未能识别到目标图片 ({os.path.basename(img_path)})</font>")
-                    return "not_found"
-                else:
-                    if not waiting_logged and self.log_level >= 1:
-                        self.log(f"    -> 未发现目标，进入持续监听等待状态...")
-                        waiting_logged = True
-                    time.sleep(self.detect_delay)
-                    continue
+        try:
+            x, y, scale = location_tuple
+            if self.log_level >= 1:
+                self.log(f"    -> 已在坐标 ({int(x)}, {int(y)}) 锁定目标并执行点击")
+            pyautogui.moveTo(x, y, duration=self.move_duration)
+            for _ in range(clickTimes):
+                pyautogui.mouseDown(button=lOrR)
+                time.sleep(self.click_hold)
+                pyautogui.mouseUp(button=lOrR)
+                if clickTimes > 1: time.sleep(0.02)
+            if self.settlement_wait > 0: time.sleep(self.settlement_wait)
+            if self.enable_dodge:
+                pyautogui.moveTo(self.dodge_x1, self.dodge_y1, duration=0)
+                if self.enable_double_dodge:
+                    time.sleep(self.double_dodge_wait)
+                    pyautogui.moveTo(self.dodge_x2, self.dodge_y2, duration=0)
+        except Exception as e:
+            if self.log_level >= 1: self.log(f"<font color='red'>    [错误] 循环#{step_info['loop']} 步{step_info['step']}: {e}</font>")
+            return "error"
+        return "success"
 
     def mouseDrag(self, button, val, step_info):
         try:
@@ -925,10 +946,20 @@ class RPAEngine:
                     retry = task.get("retry", 1)
                     fail_skip = int(task.get("fail_skip", 0))
                     
+                    task_timeout = self.timeout_val
+                    task_detect_delay = self.detect_delay
+                    allow_skip = False
                     if task.get("custom_en", False):
                         try: task_conf = float(task.get("custom_conf", self.confidence))
                         except: task_conf = self.confidence
                         use_gray = bool(task.get("custom_gray", self.enable_grayscale))
+                        try:
+                            task_timeout = float(task.get("custom_timeout", task_timeout))
+                        except: pass
+                        try:
+                            task_detect_delay = float(task.get("custom_freq", task_detect_delay))
+                        except: pass
+                        allow_skip = not bool(task.get("custom_disable_skip", True))
                     else:
                         task_conf = self.confidence
                         use_gray = self.enable_grayscale
@@ -941,9 +972,9 @@ class RPAEngine:
                     
                     status = "success"
                     try:
-                        if cmd == 1.0: status = self.mouseClick(1, "left", val, retry, step_info, cache_key, task_conf, use_gray)
-                        elif cmd == 2.0: status = self.mouseClick(2, "left", val, retry, step_info, cache_key, task_conf, use_gray)
-                        elif cmd == 3.0: status = self.mouseClick(1, "right", val, retry, step_info, cache_key, task_conf, use_gray)
+                        if cmd == 1.0: status = self.mouseClick(1, "left", val, retry, step_info, cache_key, task_conf, use_gray, task_timeout, task_detect_delay, allow_skip)
+                        elif cmd == 2.0: status = self.mouseClick(2, "left", val, retry, step_info, cache_key, task_conf, use_gray, task_timeout, task_detect_delay, allow_skip)
+                        elif cmd == 3.0: status = self.mouseClick(1, "right", val, retry, step_info, cache_key, task_conf, use_gray, task_timeout, task_detect_delay, allow_skip)
                         elif cmd == 10.0: status = self.mouseDrag("left", val, step_info)
                         elif cmd == 11.0: status = self.mouseDrag("right", val, step_info)
                         elif cmd == 12.0: 
@@ -963,27 +994,22 @@ class RPAEngine:
                             except: pass
                             status = "success"
                         elif cmd == 8.0:
-                            coord = self.parse_coordinate(val)
-                            if coord:
-                                loc = (coord[0], coord[1], 1.0)
-                                find_time = 0.0
-                            else:
-                                find_start = time.time()
-                                loc = self.find_target_optimized(val, cache_key, task_conf, use_gray)
-                                find_time = time.time() - find_start
-                                
-                            if loc: 
+                            loc, search_status = self.wait_for_target(val, cache_key, task_conf, use_gray, allow_skip, task_timeout, task_detect_delay, step_info)
+                            if loc:
                                 x, y, scale = loc
                                 if self.log_level >= 2:
                                     local_t = time.strftime("%H:%M:%S")
-                                    self.log(f"    <font color='gray'>[{local_t}] => 底层找图耗时 {find_time:.3f}s，缩放: {scale:.2f}x</font>")
+                                    self.log(f"    <font color='gray'>[{local_t}] => 已在坐标 ({int(x)}, {int(y)}) 目标锁定，缩放: {scale:.2f}x</font>")
                                 if self.log_level >= 1:
                                     self.log(f"    -> 已悬停在坐标 ({int(x)}, {int(y)})")
                                 pyautogui.moveTo(x, y, duration=self.move_duration)
                             else:
-                                status = "not_found"
+                                status = search_status
                                 if self.log_level >= 1:
-                                    self.log(f"<font color='orange'>    [异常] 循环#{loop_count} 步{idx+1}: 悬停失败，未识别到目标</font>")
+                                    if search_status == "not_found":
+                                        self.log(f"<font color='orange'>    [异常] 循环#{loop_count} 步{idx+1}: 悬停失败，未识别到目标</font>")
+                                    elif search_status == "timeout":
+                                        self.log(f"<font color='orange'>    [异常] 循环#{loop_count} 步{idx+1}: 悬停超时，未识别到目标</font>")
 
                         elif cmd == 4.0: 
                             if self.log_level >= 1: self.log(f"    -> 正在输入文本: {val}")
@@ -1190,6 +1216,9 @@ class TaskRow(QFrame):
             "custom_scale_min": data.get("custom_scale_min", "1.0"),
             "custom_scale_max": data.get("custom_scale_max", "1.0"),
             "custom_scale_step": data.get("custom_scale_step", "0.05"),
+            "custom_timeout": data.get("custom_timeout", "0.0"),
+            "custom_freq": data.get("custom_freq", "0.01"),
+            "custom_disable_skip": data.get("custom_disable_skip", True),
             "custom_gray": data.get("custom_gray", True)
         }
         
@@ -1449,6 +1478,8 @@ class RPAWindow(QMainWindow):
         self.tr_failsafe = QCheckBox("右上角急停"); self.tr_failsafe.setChecked(True); gl3_r2.addWidget(self.tr_failsafe)
         self.key_failsafe = QCheckBox("ESC/中键急停"); self.key_failsafe.setChecked(True); gl3_r2.addWidget(self.key_failsafe)
         gl3_r2.addSpacing(15)
+        self.timeout_failsafe_chk = QCheckBox("超时急停"); self.timeout_failsafe_chk.setChecked(False); gl3_r2.addWidget(self.timeout_failsafe_chk)
+        gl3_r2.addSpacing(15)
         self.log_file_chk = QCheckBox("写入文件日志"); gl3_r2.addWidget(self.log_file_chk)
         self.log_ui_chk = QCheckBox("界面日志"); self.log_ui_chk.setChecked(True); gl3_r2.addWidget(self.log_ui_chk)
         gl3_r2.addStretch()
@@ -1590,7 +1621,7 @@ class RPAWindow(QMainWindow):
             "dodge_en": self.dodge_chk.isChecked(), "dbl_dodge": self.double_dodge_chk.isChecked(), "dbl_wait": self.dbl_wait.text(),
             "move_spd": self.move_spd.text(), "click_hld": self.click_hld.text(), "settle": self.settle.text(), "timeout": self.timeout.text(), "detect_delay": self.detect_delay.text(), "playback_speed": self.playback_speed.text(),
             "hotkey_start": self.hotkey_start_combo.currentText(), "hotkey_stop": self.hotkey_stop_combo.currentText(), "log_level": self.log_level_combo.currentIndex(),
-            "tm_fs": self.tm_failsafe.isChecked(), "tr_fs": self.tr_failsafe.isChecked(), "key_fs": self.key_failsafe.isChecked(),
+            "tm_fs": self.tm_failsafe.isChecked(), "tr_fs": self.tr_failsafe.isChecked(), "key_fs": self.key_failsafe.isChecked(), "timeout_fs": self.timeout_failsafe_chk.isChecked(),
             "log_f": self.log_file_chk.isChecked(), "log_ui": self.log_ui_chk.isChecked(), "mini": self.mini_chk.isChecked(), "top": self.top_chk.isChecked(),
             "loop_mode": self.loop_combo.currentText(), "loop_val": self.loop_val_edit.text(),
             "tasks": tasks
@@ -1625,6 +1656,8 @@ class RPAWindow(QMainWindow):
             self.tm_failsafe.setChecked(bool(cfg.get("tm_fs", True)))
             self.tr_failsafe.setChecked(bool(cfg.get("tr_fs", True)))
             self.key_failsafe.setChecked(bool(cfg.get("key_fs", True)))
+            self.timeout_failsafe_chk.setChecked(bool(cfg.get("timeout_fs", False)))
+            self.timeout_failsafe_chk.setChecked(bool(cfg.get("timeout_fs", False)))
             
             self.log_file_chk.setChecked(bool(cfg.get("log_f", False)))
             self.log_ui_chk.setChecked(bool(cfg.get("log_ui", True)))
@@ -1763,6 +1796,7 @@ class RPAWindow(QMainWindow):
         self.tm_failsafe.stateChanged.connect(lambda s: self.log_setting_change("任务管理器急停", "开启" if s else "关闭"))
         self.tr_failsafe.stateChanged.connect(lambda s: self.log_setting_change("右上角急停", "开启" if s else "关闭"))
         self.key_failsafe.stateChanged.connect(lambda s: self.log_setting_change("ESC/中键急停", "开启" if s else "关闭"))
+        self.timeout_failsafe_chk.stateChanged.connect(lambda s: self.log_setting_change("超时急停", "开启" if s else "关闭"))
         self.log_file_chk.stateChanged.connect(lambda s: self.log_setting_change("写入文件日志", "开启" if s else "关闭"))
         self.log_ui_chk.stateChanged.connect(lambda s: self.log_setting_change("显示界面日志", "开启" if s else "关闭"))
         self.mini_chk.stateChanged.connect(lambda s: self.log_setting_change("启动时最小化", "开启" if s else "关闭"))
@@ -1954,6 +1988,16 @@ class RPAWindow(QMainWindow):
             
             if fail_skip and not fail_skip.isdigit():
                 return f"第 {i+1} 步的'失败跳过'必须是整数！\n填入内容: {fail_skip}"
+
+            if task.get("custom_en", False):
+                timeout_text = str(task.get("custom_timeout", "0.0")).strip()
+                freq_text = str(task.get("custom_freq", "0.01")).strip()
+                if timeout_text:
+                    try: float(timeout_text)
+                    except: return f"第 {i+1} 步独立超时必须是数字！\n填入内容: {timeout_text}"
+                if freq_text:
+                    try: float(freq_text)
+                    except: return f"第 {i+1} 步独立识别频率必须是数字！\n填入内容: {freq_text}"
             
             if not v and t not in [9.0, 12.0, 13.0, 14.0]: 
                 return f"第 {i+1} 步参数不能为空！"
@@ -2012,6 +2056,8 @@ class RPAWindow(QMainWindow):
             self.engine.enable_tm_stop = cfg["tm_fs"]
             self.engine.enable_tr_stop = cfg["tr_fs"]
             self.engine.enable_key_stop = cfg["key_fs"]
+            self.engine.timeout_failsafe = cfg.get("timeout_fs", False)
+            self.engine.timeout_failsafe = cfg.get("timeout_fs", False)
         except: return QMessageBox.warning(self, "错误", "数值格式错误")
 
         if GLOBAL_CONFIG["log_to_ui"]:
