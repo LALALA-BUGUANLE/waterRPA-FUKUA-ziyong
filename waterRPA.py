@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QPushButton, QLabel, QComboBox, QLineEdit, QScrollArea, 
                                QFileDialog, QTextEdit, QMessageBox, QFrame, QCheckBox, QGroupBox, QToolTip,
                                QListWidget, QListWidgetItem, QAbstractItemView, QInputDialog, QSplitter,
-                               QDialog, QDialogButtonBox, QFormLayout)
+                               QDialog, QDialogButtonBox, QFormLayout, QMenu)
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QRect, QSettings, QPoint
 from PySide6.QtGui import QCursor, QFont, QColor, QPalette, QBrush, QPen, QPainter, QRegion
 import pyperclip
@@ -231,8 +231,12 @@ class TaskConfigDialog(QDialog):
         self.s_step_edit = QLineEdit(str(data.get("custom_scale_step", "0.05")))
         self.timeout_edit = QLineEdit(str(data.get("custom_timeout", "0.0")))
         self.freq_edit = QLineEdit(str(data.get("custom_freq", "0.01")))
-        self.disable_skip_chk = QCheckBox("禁止立即跳过，持续等待直到超时")
-        self.disable_skip_chk.setChecked(data.get("custom_disable_skip", True))
+        action_default = data.get("custom_timeout_action")
+        if not action_default:
+            action_default = "禁止跳过" if data.get("custom_disable_skip", True) else "跳过"
+        self.timeout_action_combo = QComboBox()
+        self.timeout_action_combo.addItems(["禁止跳过", "跳过", "急停"])
+        self.timeout_action_combo.setCurrentText(action_default)
         self.gray_chk = QCheckBox("灰度匹配 (取消则严格区分颜色)")
         self.gray_chk.setChecked(data.get("custom_gray", True))
         
@@ -242,7 +246,7 @@ class TaskConfigDialog(QDialog):
         form.addRow("缩放步长:", self.s_step_edit)
         form.addRow("识别超时(s):", self.timeout_edit)
         form.addRow("识别频率(s):", self.freq_edit)
-        form.addRow("策略:", self.disable_skip_chk)
+        form.addRow("识别超时策略:", self.timeout_action_combo)
         form.addRow("色彩模式:", self.gray_chk)
         
         layout.addWidget(self.form_widget)
@@ -251,7 +255,7 @@ class TaskConfigDialog(QDialog):
         
         self.timeout_edit.setToolTip("当目标未找到时，最多等待此时间后结束识别，0表示使用全局超时设置。")
         self.freq_edit.setToolTip("识别循环间隔，单位秒。数值越小检测越频繁。")
-        self.disable_skip_chk.setToolTip("勾选后，当找不到目标时会一直等待直到超时或找到》不勾选则会立即跳过当前指令。")
+        self.timeout_action_combo.setToolTip("当独立识别超时后，选择一个动作：禁止跳过=等待到超时后继续；跳过=直接跳过当前指令；急停=停止整个脚本。")
         
         btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn_box.accepted.connect(self.accept)
@@ -267,7 +271,7 @@ class TaskConfigDialog(QDialog):
             "custom_scale_step": self.s_step_edit.text(),
             "custom_timeout": self.timeout_edit.text(),
             "custom_freq": self.freq_edit.text(),
-            "custom_disable_skip": self.disable_skip_chk.isChecked(),
+            "custom_timeout_action": self.timeout_action_combo.currentText(),
             "custom_gray": self.gray_chk.isChecked()
         }
 
@@ -632,7 +636,6 @@ class RPAEngine:
         self.enable_tm_stop = True 
         self.enable_tr_stop = True 
         self.enable_key_stop = True
-        self.timeout_failsafe = False
         
         self.callback_msg = None
         self.opencv_available = False 
@@ -793,7 +796,7 @@ class RPAEngine:
                 except: continue
         return None
 
-    def wait_for_target(self, img_path, cache_key, task_conf, use_gray, allow_skip=True, task_timeout=None, detect_delay=None, step_info=None):
+    def wait_for_target(self, img_path, cache_key, task_conf, use_gray, allow_skip=True, task_timeout=None, detect_delay=None, step_info=None, timeout_action="禁止跳过"):
         if step_info is None: step_info = {'step': 0, 'loop': 0, 'cmd': ''}
         timeout_val = self.timeout_val if task_timeout is None else float(task_timeout)
         detect_delay_val = self.detect_delay if detect_delay is None else float(detect_delay)
@@ -813,8 +816,8 @@ class RPAEngine:
 
             if timeout_val > 0.001 and (time.time() - start_time > timeout_val):
                 if self.log_level >= 1:
-                    self.log(f"<font color='orange'>    [超时] 循环#{step_info['loop']} 步{step_info['step']}: 目标未找到，超时后跳过</font>")
-                if self.timeout_failsafe:
+                    self.log(f"<font color='orange'>    [超时] 循环#{step_info['loop']} 步{step_info['step']}: 目标未找到，超时后处理策略: {timeout_action}</font>")
+                if timeout_action == "急停":
                     self.log(f"<font color='red'><b>    !!! 超时急停触发 !!!</b></font>")
                     self.stop()
                 return None, "timeout"
@@ -852,9 +855,9 @@ class RPAEngine:
         except: pass
         return None
 
-    def mouseClick(self, clickTimes, lOrR, img_path, reTry, step_info=None, cache_key=None, task_conf=0.8, use_gray=True, task_timeout=None, task_detect_delay=None, allow_skip=True):
+    def mouseClick(self, clickTimes, lOrR, img_path, reTry, step_info=None, cache_key=None, task_conf=0.8, use_gray=True, task_timeout=None, task_detect_delay=None, allow_skip=True, timeout_action="禁止跳过"):
         if step_info is None: step_info = {'step': 0, 'loop': 0, 'cmd': ''}
-        location_tuple, status = self.wait_for_target(img_path, cache_key, task_conf, use_gray, allow_skip, task_timeout, task_detect_delay, step_info)
+        location_tuple, status = self.wait_for_target(img_path, cache_key, task_conf, use_gray, allow_skip, task_timeout, task_detect_delay, step_info, timeout_action)
         if status != "success":
             if status == "not_found" and self.log_level >= 1:
                 self.log(f"<font color='orange'>    [跳过] 循环#{step_info['loop']} 步{step_info['step']}: 未能识别到目标图片 ({os.path.basename(img_path)})</font>")
@@ -949,6 +952,7 @@ class RPAEngine:
                     task_timeout = self.timeout_val
                     task_detect_delay = self.detect_delay
                     allow_skip = False
+                    timeout_action = "禁止跳过"
                     if task.get("custom_en", False):
                         try: task_conf = float(task.get("custom_conf", self.confidence))
                         except: task_conf = self.confidence
@@ -959,10 +963,12 @@ class RPAEngine:
                         try:
                             task_detect_delay = float(task.get("custom_freq", task_detect_delay))
                         except: pass
-                        allow_skip = not bool(task.get("custom_disable_skip", True))
+                        timeout_action = str(task.get("custom_timeout_action", "禁止跳过"))
+                        allow_skip = timeout_action == "跳过"
                     else:
                         task_conf = self.confidence
                         use_gray = self.enable_grayscale
+                        allow_skip = False
                         
                     cache_key = task.get('cache_key', f"{val}_{self.min_scale}_{self.max_scale}_{self.scale_step}_{use_gray}")
 
@@ -972,9 +978,9 @@ class RPAEngine:
                     
                     status = "success"
                     try:
-                        if cmd == 1.0: status = self.mouseClick(1, "left", val, retry, step_info, cache_key, task_conf, use_gray, task_timeout, task_detect_delay, allow_skip)
-                        elif cmd == 2.0: status = self.mouseClick(2, "left", val, retry, step_info, cache_key, task_conf, use_gray, task_timeout, task_detect_delay, allow_skip)
-                        elif cmd == 3.0: status = self.mouseClick(1, "right", val, retry, step_info, cache_key, task_conf, use_gray, task_timeout, task_detect_delay, allow_skip)
+                        if cmd == 1.0: status = self.mouseClick(1, "left", val, retry, step_info, cache_key, task_conf, use_gray, task_timeout, task_detect_delay, allow_skip, timeout_action)
+                        elif cmd == 2.0: status = self.mouseClick(2, "left", val, retry, step_info, cache_key, task_conf, use_gray, task_timeout, task_detect_delay, allow_skip, timeout_action)
+                        elif cmd == 3.0: status = self.mouseClick(1, "right", val, retry, step_info, cache_key, task_conf, use_gray, task_timeout, task_detect_delay, allow_skip, timeout_action)
                         elif cmd == 10.0: status = self.mouseDrag("left", val, step_info)
                         elif cmd == 11.0: status = self.mouseDrag("right", val, step_info)
                         elif cmd == 12.0: 
@@ -994,7 +1000,7 @@ class RPAEngine:
                             except: pass
                             status = "success"
                         elif cmd == 8.0:
-                            loc, search_status = self.wait_for_target(val, cache_key, task_conf, use_gray, allow_skip, task_timeout, task_detect_delay, step_info)
+                            loc, search_status = self.wait_for_target(val, cache_key, task_conf, use_gray, allow_skip, task_timeout, task_detect_delay, step_info, timeout_action)
                             if loc:
                                 x, y, scale = loc
                                 if self.log_level >= 2:
@@ -1210,6 +1216,9 @@ class TaskRow(QFrame):
         self.value_input.setText(str(data.get("value", "")))
         self.skip_input.setText(str(data.get("fail_skip", "0")))
         
+        timeout_action = data.get("custom_timeout_action")
+        if not timeout_action:
+            timeout_action = "禁止跳过" if data.get("custom_disable_skip", True) else "跳过"
         self.custom_data = {
             "custom_en": data.get("custom_en", False),
             "custom_conf": data.get("custom_conf", "0.8"),
@@ -1218,7 +1227,7 @@ class TaskRow(QFrame):
             "custom_scale_step": data.get("custom_scale_step", "0.05"),
             "custom_timeout": data.get("custom_timeout", "0.0"),
             "custom_freq": data.get("custom_freq", "0.01"),
-            "custom_disable_skip": data.get("custom_disable_skip", True),
+            "custom_timeout_action": timeout_action,
             "custom_gray": data.get("custom_gray", True)
         }
         
@@ -1270,6 +1279,30 @@ class DraggableListWidget(QListWidget):
         self.setDragDropMode(QAbstractItemView.InternalMove)
         self.setDefaultDropAction(Qt.MoveAction)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_context_menu)
+
+    def show_context_menu(self, pos):
+        item = self.itemAt(pos)
+        if item is None:
+            return
+        self.setCurrentItem(item)
+        window = self.window()
+        menu = QMenu(self)
+        insert_action = menu.addAction("插入新增指令")
+        copy_action = menu.addAction("复制指令")
+        paste_action = menu.addAction("黏贴指令")
+        paste_action.setEnabled(bool(getattr(window, 'copied_task_data', None)))
+        selected = menu.exec(self.viewport().mapToGlobal(pos))
+        if selected == insert_action:
+            if hasattr(window, 'insert_row'):
+                window.insert_row(self.row(item))
+        elif selected == copy_action:
+            if hasattr(window, 'copy_task'):
+                window.copy_task(item)
+        elif selected == paste_action:
+            if hasattr(window, 'paste_task'):
+                window.paste_task(self.row(item) + 1)
 
     def dropEvent(self, event):
         super().dropEvent(event)
@@ -1288,7 +1321,7 @@ class DraggableListWidget(QListWidget):
 class RPAWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("不高兴就喝水 RPA配置工具(浮夸改v1.2)")
+        self.setWindowTitle("自用1.1版")
         self.resize(800, 850)
         self.engine = RPAEngine()
         
@@ -1307,6 +1340,7 @@ class RPAWindow(QMainWindow):
         self.hotkey_start_vk = 0x78 
         self.hotkey_stop_vk = 0x79  
         self.current_process = None
+        self.copied_task_data = None
         if HAS_PSUTIL:
             try: self.current_process = psutil.Process()
             except: pass
@@ -1478,8 +1512,6 @@ class RPAWindow(QMainWindow):
         self.tr_failsafe = QCheckBox("右上角急停"); self.tr_failsafe.setChecked(True); gl3_r2.addWidget(self.tr_failsafe)
         self.key_failsafe = QCheckBox("ESC/中键急停"); self.key_failsafe.setChecked(True); gl3_r2.addWidget(self.key_failsafe)
         gl3_r2.addSpacing(15)
-        self.timeout_failsafe_chk = QCheckBox("超时急停"); self.timeout_failsafe_chk.setChecked(False); gl3_r2.addWidget(self.timeout_failsafe_chk)
-        gl3_r2.addSpacing(15)
         self.log_file_chk = QCheckBox("写入文件日志"); gl3_r2.addWidget(self.log_file_chk)
         self.log_ui_chk = QCheckBox("界面日志"); self.log_ui_chk.setChecked(True); gl3_r2.addWidget(self.log_ui_chk)
         gl3_r2.addStretch()
@@ -1621,7 +1653,7 @@ class RPAWindow(QMainWindow):
             "dodge_en": self.dodge_chk.isChecked(), "dbl_dodge": self.double_dodge_chk.isChecked(), "dbl_wait": self.dbl_wait.text(),
             "move_spd": self.move_spd.text(), "click_hld": self.click_hld.text(), "settle": self.settle.text(), "timeout": self.timeout.text(), "detect_delay": self.detect_delay.text(), "playback_speed": self.playback_speed.text(),
             "hotkey_start": self.hotkey_start_combo.currentText(), "hotkey_stop": self.hotkey_stop_combo.currentText(), "log_level": self.log_level_combo.currentIndex(),
-            "tm_fs": self.tm_failsafe.isChecked(), "tr_fs": self.tr_failsafe.isChecked(), "key_fs": self.key_failsafe.isChecked(), "timeout_fs": self.timeout_failsafe_chk.isChecked(),
+            "tm_fs": self.tm_failsafe.isChecked(), "tr_fs": self.tr_failsafe.isChecked(), "key_fs": self.key_failsafe.isChecked(),
             "log_f": self.log_file_chk.isChecked(), "log_ui": self.log_ui_chk.isChecked(), "mini": self.mini_chk.isChecked(), "top": self.top_chk.isChecked(),
             "loop_mode": self.loop_combo.currentText(), "loop_val": self.loop_val_edit.text(),
             "tasks": tasks
@@ -1656,8 +1688,6 @@ class RPAWindow(QMainWindow):
             self.tm_failsafe.setChecked(bool(cfg.get("tm_fs", True)))
             self.tr_failsafe.setChecked(bool(cfg.get("tr_fs", True)))
             self.key_failsafe.setChecked(bool(cfg.get("key_fs", True)))
-            self.timeout_failsafe_chk.setChecked(bool(cfg.get("timeout_fs", False)))
-            self.timeout_failsafe_chk.setChecked(bool(cfg.get("timeout_fs", False)))
             
             self.log_file_chk.setChecked(bool(cfg.get("log_f", False)))
             self.log_ui_chk.setChecked(bool(cfg.get("log_ui", True)))
@@ -1796,7 +1826,6 @@ class RPAWindow(QMainWindow):
         self.tm_failsafe.stateChanged.connect(lambda s: self.log_setting_change("任务管理器急停", "开启" if s else "关闭"))
         self.tr_failsafe.stateChanged.connect(lambda s: self.log_setting_change("右上角急停", "开启" if s else "关闭"))
         self.key_failsafe.stateChanged.connect(lambda s: self.log_setting_change("ESC/中键急停", "开启" if s else "关闭"))
-        self.timeout_failsafe_chk.stateChanged.connect(lambda s: self.log_setting_change("超时急停", "开启" if s else "关闭"))
         self.log_file_chk.stateChanged.connect(lambda s: self.log_setting_change("写入文件日志", "开启" if s else "关闭"))
         self.log_ui_chk.stateChanged.connect(lambda s: self.log_setting_change("显示界面日志", "开启" if s else "关闭"))
         self.mini_chk.stateChanged.connect(lambda s: self.log_setting_change("启动时最小化", "开启" if s else "关闭"))
@@ -1913,15 +1942,43 @@ class RPAWindow(QMainWindow):
             if widget and hasattr(widget, 'set_index'):
                 widget.set_index(i + 1)
 
-    def add_row(self, data=None):
+    def insert_row(self, index=None, data=None):
         row_widget = TaskRow(delete_callback=self.del_row)
         if data: row_widget.set_data(data)
-        item = QListWidgetItem(self.task_list)
+        item = QListWidgetItem()
+        if index is None or index < 0 or index >= self.task_list.count():
+            self.task_list.addItem(item)
+        else:
+            self.task_list.insertItem(index, item)
         item.setSizeHint(row_widget.sizeHint())
         self.task_list.setItemWidget(item, row_widget)
         row_widget.set_parent_item(item)
         item.setData(Qt.UserRole, row_widget.get_data())
         self.update_indexes()
+
+    def add_row(self, data=None):
+        self.insert_row(None, data)
+
+    def copy_task(self, item):
+        if item is None: return
+        data = item.data(Qt.UserRole)
+        if not data: return
+        self.copied_task_data = json.loads(json.dumps(data))
+        if GLOBAL_CONFIG["log_to_ui"]:
+            self.append_log(f"<font color='#2196F3'>>>>> 已复制指令</font>")
+
+    def paste_task(self, index=None):
+        if not getattr(self, 'copied_task_data', None): return
+        data = json.loads(json.dumps(self.copied_task_data))
+        self.insert_row(index, data)
+
+    def restore_row_widget(self, item, data):
+        row_widget = TaskRow(delete_callback=self.del_row)
+        row_widget.set_data(data)
+        item.setSizeHint(row_widget.sizeHint())
+        self.task_list.setItemWidget(item, row_widget)
+        row_widget.set_parent_item(item)
+        item.setData(Qt.UserRole, row_widget.get_data())
 
     def del_row(self, row_widget):
         for i in range(self.task_list.count()):
@@ -2056,8 +2113,6 @@ class RPAWindow(QMainWindow):
             self.engine.enable_tm_stop = cfg["tm_fs"]
             self.engine.enable_tr_stop = cfg["tr_fs"]
             self.engine.enable_key_stop = cfg["key_fs"]
-            self.engine.timeout_failsafe = cfg.get("timeout_fs", False)
-            self.engine.timeout_failsafe = cfg.get("timeout_fs", False)
         except: return QMessageBox.warning(self, "错误", "数值格式错误")
 
         if GLOBAL_CONFIG["log_to_ui"]:
