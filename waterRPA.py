@@ -24,8 +24,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QFileDialog, QTextEdit, QMessageBox, QFrame, QCheckBox, QGroupBox, QToolTip,
                                QListWidget, QListWidgetItem, QAbstractItemView, QInputDialog, QSplitter,
                                QDialog, QDialogButtonBox, QFormLayout, QMenu)
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QRect, QSettings, QPoint
-from PySide6.QtGui import QCursor, QFont, QColor, QPalette, QBrush, QPen, QPainter, QRegion
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QRect, QSettings, QPoint, QEvent
+from PySide6.QtGui import QCursor, QFont, QColor, QPalette, QBrush, QPen, QPainter, QRegion, QKeySequence, QShortcut
 import pyperclip
 from PIL import Image
 import pyautogui
@@ -239,6 +239,7 @@ class TaskConfigDialog(QDialog):
         self.timeout_action_combo.setCurrentText(action_default)
         self.gray_chk = QCheckBox("灰度匹配 (取消则严格区分颜色)")
         self.gray_chk.setChecked(data.get("custom_gray", True))
+        self.gray_chk.setStyleSheet("font-weight: bold; color: #E91E63;")
         
         form.addRow("目标相似度:", self.conf_edit)
         form.addRow("最小缩放倍率:", self.s_min_edit)
@@ -261,6 +262,9 @@ class TaskConfigDialog(QDialog):
         btn_box.accepted.connect(self.accept)
         btn_box.rejected.connect(self.reject)
         layout.addWidget(btn_box)
+        # --- 在这里修改文字 ---
+        btn_box.button(QDialogButtonBox.Ok).setText("确认")
+        btn_box.button(QDialogButtonBox.Cancel).setText("取消")
 
     def get_data(self):
         return {
@@ -1147,6 +1151,10 @@ class TaskRow(QFrame):
         self.del_btn.setFixedWidth(25)
         self.del_btn.clicked.connect(lambda: delete_callback(self))
         self.layout.addWidget(self.del_btn)
+
+        for w in [self.type_combo, self.value_input, self.file_btn, self.cfg_btn, self.skip_input, self.del_btn]:
+            w.installEventFilter(self)
+        self.installEventFilter(self)
         
         self.on_type_changed(self.type_combo.currentText())
 
@@ -1273,6 +1281,26 @@ class TaskRow(QFrame):
     def set_index(self, index):
         self.index_label.setText(f"{index}.")
 
+    def set_selected(self, selected):
+        if selected:
+            self.setStyleSheet("background-color: #D4EDFF; border: 1px solid #64B5F6; border-radius: 4px;")
+        else:
+            self.setStyleSheet("")
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            self.select_item()
+        return super().eventFilter(obj, event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.select_item()
+        super().mousePressEvent(event)
+
+    def select_item(self):
+        if getattr(self, 'parent_item', None) and self.parent_item.listWidget():
+            self.parent_item.listWidget().setCurrentItem(self.parent_item)
+
 class DraggableListWidget(QListWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1321,7 +1349,7 @@ class DraggableListWidget(QListWidget):
 class RPAWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("自用1.1版")
+        self.setWindowTitle("自用1.2版")
         self.resize(800, 850)
         self.engine = RPAEngine()
         
@@ -1341,6 +1369,9 @@ class RPAWindow(QMainWindow):
         self.hotkey_stop_vk = 0x79  
         self.current_process = None
         self.copied_task_data = None
+        self.undo_stack = []
+        self.redo_stack = []
+        self.history_enabled = True
         if HAS_PSUTIL:
             try: self.current_process = psutil.Process()
             except: pass
@@ -1525,7 +1556,17 @@ class RPAWindow(QMainWindow):
         self.splitter = QSplitter(Qt.Vertical)
         
         self.task_list = DraggableListWidget()
+        self.task_list.currentItemChanged.connect(self.on_task_selection_changed)
         self.splitter.addWidget(self.task_list)
+        
+        self.copy_shortcut = QShortcut(QKeySequence.Copy, self.task_list)
+        self.copy_shortcut.activated.connect(self.copy_selected_task)
+        self.paste_shortcut = QShortcut(QKeySequence.Paste, self.task_list)
+        self.paste_shortcut.activated.connect(self.paste_selected_task)
+        self.undo_shortcut = QShortcut(QKeySequence.Undo, self.task_list)
+        self.undo_shortcut.activated.connect(self.undo_action)
+        self.redo_shortcut = QShortcut(QKeySequence.Redo, self.task_list)
+        self.redo_shortcut.activated.connect(self.redo_action)
         
         bottom_widget = QWidget()
         bottom_vbox = QVBoxLayout(bottom_widget)
@@ -1959,6 +2000,39 @@ class RPAWindow(QMainWindow):
     def add_row(self, data=None):
         self.insert_row(None, data)
 
+    def record_history(self, action_type, index, data):
+        if not self.history_enabled:
+            return
+        self.undo_stack.append({
+            "action": action_type,
+            "index": index,
+            "data": json.loads(json.dumps(data))
+        })
+        self.redo_stack.clear()
+
+    def insert_row(self, index=None, data=None, record=True):
+        if data is None:
+            data = {}
+        count = self.task_list.count()
+        if index is None or index < 0 or index > count:
+            index = count
+        row_widget = TaskRow(delete_callback=self.del_row)
+        if data:
+            row_widget.set_data(data)
+        item = QListWidgetItem()
+        if index >= self.task_list.count():
+            self.task_list.addItem(item)
+        else:
+            self.task_list.insertItem(index, item)
+        item.setSizeHint(row_widget.sizeHint())
+        self.task_list.setItemWidget(item, row_widget)
+        row_widget.set_parent_item(item)
+        item.setData(Qt.UserRole, row_widget.get_data())
+        self.update_indexes()
+        self.task_list.setCurrentItem(item)
+        if record:
+            self.record_history("insert", index, data)
+
     def copy_task(self, item):
         if item is None: return
         data = item.data(Qt.UserRole)
@@ -1972,6 +2046,28 @@ class RPAWindow(QMainWindow):
         data = json.loads(json.dumps(self.copied_task_data))
         self.insert_row(index, data)
 
+    def copy_selected_task(self):
+        item = self.task_list.currentItem()
+        if item is None: return
+        self.copy_task(item)
+
+    def paste_selected_task(self):
+        item = self.task_list.currentItem()
+        if item is None:
+            self.paste_task(None)
+            return
+        self.paste_task(self.task_list.row(item) + 1)
+
+    def on_task_selection_changed(self, current, previous):
+        if previous is not None:
+            prev_widget = self.task_list.itemWidget(previous)
+            if hasattr(prev_widget, 'set_selected'):
+                prev_widget.set_selected(False)
+        if current is not None:
+            current_widget = self.task_list.itemWidget(current)
+            if hasattr(current_widget, 'set_selected'):
+                current_widget.set_selected(True)
+
     def restore_row_widget(self, item, data):
         row_widget = TaskRow(delete_callback=self.del_row)
         row_widget.set_data(data)
@@ -1980,13 +2076,57 @@ class RPAWindow(QMainWindow):
         row_widget.set_parent_item(item)
         item.setData(Qt.UserRole, row_widget.get_data())
 
-    def del_row(self, row_widget):
+    def remove_row_by_index(self, index, record=True):
+        if index < 0 or index >= self.task_list.count():
+            return
+        item = self.task_list.takeItem(index)
+        if item is None:
+            return
+        data = item.data(Qt.UserRole)
+        if record and data is not None:
+            self.record_history("delete", index, data)
+        self.update_indexes()
+
+    def del_row(self, row_widget, record=True):
         for i in range(self.task_list.count()):
             item = self.task_list.item(i)
             if self.task_list.itemWidget(item) == row_widget:
+                data = item.data(Qt.UserRole)
                 self.task_list.takeItem(i)
+                if record and data is not None:
+                    self.record_history("delete", i, data)
                 break
         self.update_indexes()
+
+    def undo_action(self):
+        if not self.undo_stack:
+            return
+        action = self.undo_stack.pop()
+        if action["action"] == "insert":
+            self.history_enabled = False
+            self.remove_row_by_index(action["index"], record=False)
+            self.history_enabled = True
+            self.redo_stack.append(action)
+        elif action["action"] == "delete":
+            self.history_enabled = False
+            self.insert_row(action["index"], action["data"], record=False)
+            self.history_enabled = True
+            self.redo_stack.append(action)
+
+    def redo_action(self):
+        if not self.redo_stack:
+            return
+        action = self.redo_stack.pop()
+        if action["action"] == "insert":
+            self.history_enabled = False
+            self.insert_row(action["index"], action["data"], record=False)
+            self.history_enabled = True
+            self.undo_stack.append(action)
+        elif action["action"] == "delete":
+            self.history_enabled = False
+            self.remove_row_by_index(action["index"], record=False)
+            self.history_enabled = True
+            self.undo_stack.append(action)
 
     def save(self):
         data = self.get_current_ui_config()
